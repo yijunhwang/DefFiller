@@ -1,4 +1,5 @@
 import argparse
+from collections.abc import Mapping
 from PIL import Image, ImageDraw
 from omegaconf import OmegaConf
 from ldm.models.diffusion.ddim import DDIMSampler
@@ -74,10 +75,58 @@ def alpha_generator(length, type=None):
 
 
 
+def get_grounding_type(config):
+    tokenizer = config.get("grounding_tokenizer_input")
+    if not isinstance(tokenizer, Mapping):
+        raise ValueError("Checkpoint config must contain grounding_tokenizer_input with a target.")
+
+    supported_targets = {
+        f"grounding_input.{kind}_grounding_tokinzer_input.GroundingNetInput": kind
+        for kind in ("keypoint", "hed", "canny", "depth", "normal", "sem", "text", "text_image")
+    }
+    target = tokenizer.get("target")
+    if not isinstance(target, str) or target not in supported_targets:
+        raise ValueError(f"Unsupported checkpoint grounding_tokenizer_input.target: {target!r}")
+    grounding_type = supported_targets[target]
+
+    downsampler = config.get("grounding_downsampler_input")
+    if downsampler is not None:
+        expected = None
+        if grounding_type in ("hed", "canny", "depth", "normal", "sem"):
+            expected = f"grounding_input.{grounding_type}_grounding_downsampler_input.GroundingDSInput"
+        actual = downsampler.get("target") if isinstance(downsampler, Mapping) else None
+        if expected is None or actual != expected:
+            raise ValueError(
+                f"Incompatible checkpoint grounding_downsampler_input.target: {actual!r} "
+                f"for grounding_tokenizer_input.target {target!r}; expected {expected!r}."
+            )
+    return grounding_type
+
+
+def validate_checkpoint(saved_ckpt, ckpt_path):
+    if not isinstance(saved_ckpt, Mapping):
+        raise ValueError(f"Invalid checkpoint {ckpt_path!r}: expected a mapping.")
+    required = ("model", "autoencoder", "text_encoder", "diffusion", "config_dict")
+    missing = [key for key in required if key not in saved_ckpt]
+    if missing:
+        raise ValueError(f"Invalid checkpoint {ckpt_path!r}: missing required fields: {', '.join(missing)}")
+
+    config_dict = saved_ckpt["config_dict"]
+    if not isinstance(config_dict, Mapping) or not isinstance(config_dict.get("_content"), Mapping):
+        raise ValueError(f"Invalid checkpoint {ckpt_path!r}: config_dict['_content'] must be a mapping.")
+    config = config_dict["_content"]
+    missing = [key for key in ("model", "autoencoder", "text_encoder", "diffusion") if key not in config]
+    if missing:
+        raise ValueError(f"Invalid checkpoint {ckpt_path!r}: config_dict['_content'] is missing: {', '.join(missing)}")
+    get_grounding_type(config)
+    return config
+
+
 def load_ckpt(ckpt_path):
-    
+    if not os.path.isfile(ckpt_path):
+        raise FileNotFoundError(f"Checkpoint file not found: {ckpt_path}. Specify a complete DefFiller checkpoint with --ckpt.")
     saved_ckpt = torch.load(ckpt_path)
-    config = saved_ckpt["config_dict"]["_content"]
+    config = validate_checkpoint(saved_ckpt, ckpt_path)
 
     model = instantiate_from_config(config['model']).to(device).eval()
     autoencoder = instantiate_from_config(config['autoencoder']).to(device).eval()
@@ -365,7 +414,7 @@ def run(meta, config, starting_noise=None):
     model.grounding_tokenizer_input = grounding_tokenizer_input
     
     grounding_downsampler_input = None
-    if "grounding_downsampler_input" in config:
+    if config.get("grounding_downsampler_input") is not None:
         grounding_downsampler_input = instantiate_from_config(config['grounding_downsampler_input'])
 
 
@@ -376,17 +425,18 @@ def run(meta, config, starting_noise=None):
 
 
     # - - - - - prepare batch - - - - - #
-    if "keypoint" in meta["ckpt"]:
+    grounding_type = get_grounding_type(config)
+    if grounding_type == "keypoint":
         batch = prepare_batch_kp(meta, config.batch_size)
-    elif "hed" in meta["ckpt"]:
+    elif grounding_type == "hed":
         batch = prepare_batch_hed(meta, config.batch_size)
-    elif "canny" in meta["ckpt"]:
+    elif grounding_type == "canny":
         batch = prepare_batch_canny(meta, config.batch_size)
-    elif "depth" in meta["ckpt"]:
+    elif grounding_type == "depth":
         batch = prepare_batch_depth(meta, config.batch_size)
-    elif "normal" in meta["ckpt"]:
+    elif grounding_type == "normal":
         batch = prepare_batch_normal(meta, config.batch_size)
-    elif "sem" in meta["ckpt"]:
+    elif grounding_type == "sem":
         batch = prepare_batch_sem(meta, config.batch_size)
     else:
         batch = prepare_batch(meta, config.batch_size)
@@ -465,6 +515,8 @@ if __name__ == "__main__":
     
 
     parser = argparse.ArgumentParser()
+    parser.add_argument("--ckpt", type=str, default="./OUTPUT/sd/tag02/sem_checkpoint_latest.pth",
+                        help="path to a complete DefFiller checkpoint")
     parser.add_argument("--folder", type=str,  default="generation_samples", help="root folder for output")
     
     parser.add_argument("--mask_dir", type=str,  default='./DATA/SD-saliency-900/Ground_truth')
@@ -476,6 +528,8 @@ if __name__ == "__main__":
     parser.add_argument("--no_plms", action='store_true', help="use DDIM instead. WARNING: I did not test the code yet")
     parser.add_argument("--negative_prompt", type=str,  default=None, help="")
     args = parser.parse_args()
+    if not os.path.isfile(args.ckpt):
+        parser.error(f"Checkpoint file not found: {args.ckpt}. Specify a complete DefFiller checkpoint with --ckpt.")
     
     files = list_files(args.mask_dir)
 
@@ -483,7 +537,7 @@ if __name__ == "__main__":
 
     for file in files:
         meta_list.append( dict(
-            ckpt ="./OUTPUT/sd/tag02/sem_checkpoint_latest.pth",
+            ckpt =args.ckpt,
             prompt = args.prompt, 
             sem = file, 
             alpha_type = [0.7, 0, 0.3], 
